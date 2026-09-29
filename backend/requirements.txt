@@ -1,0 +1,25 @@
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic-settings>=2.0.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pytest>=7.4.0
+httpx>=0.25.0
+imageio-ffmpeg>=0.6.0
+pillow>=10.0.0
+numpy>=2.0.0
+
+# Vision AI (optional)
+# To enable real Qwen2.5-VL inference, install and set VISION_PROVIDER=qwen2vl:
+# torch>=2.14.0
+# transformers>=5.17.0
+# accelerate>=1.15.0
+# safetensors>=0.8.0
+# Then set VISION_MODEL_NAME=Qwen2.5-VL in .env
+
+# Audio AI (optional)
+# To enable real speech transcription, install faster-whisper:
+# faster-whisper
+# librosa
+# Then set AUDIO_PROVIDER=whisper in .env
