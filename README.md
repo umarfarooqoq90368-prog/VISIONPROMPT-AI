@@ -2556,3 +2556,514 @@ GET /api/videos/{stored_filename}/prompt/history/compare/{version_a}/{version_b}
 - `backend/app/api/videos.py` - Added `GET .../compare/{version_a}/{version_b}/readiness` endpoint and service instance
 - `tests/test_prompt_readiness_change_service.py` - 116 service tests
 - `tests/test_prompt_readiness_change_api.py` - 45 API tests
+
+
+## Day 27 - Prompt Readiness Timeline
+
+Day 27 adds **Prompt Readiness Timeline**: a deterministic, read-only service that chains Day 26 readiness diffs across consecutive saved prompt versions, answering one question - *"how did production readiness change between each consecutive pair of saved versions?"* Every timeline step is byte-for-byte a Day 26 comparison output; Day 27 only selects version pairs and aggregates their numbers. It never ranks versions, never picks a best version, and never predicts which prompt will generate better video. This is not an LLM feature; no external AI/API/model is called.
+
+### Purpose
+
+- Chain Day 26 `compare_versions` results across consecutive selected versions (n versions -> n-1 steps)
+- Give one neutral aggregate summary of the whole chain (totals, transition sums, first/last coverage)
+- Keep every step identical to calling the Day 26 endpoint for that pair directly
+- Support the exact Day 25 `versions` selection semantics (requested order preserved, never substituted or reordered)
+- Reuse Day 16's single store read-only - no second store, no cache, no persisted timeline
+
+### Relationship With Day 16/21/24/25/26
+
+- Day 16 `PromptHistoryService` is still the only version store; Day 27 calls only `list_versions` (default selection) and `get_version` (explicit selection), both read-only
+- Day 26 `PromptReadinessChangeService` is the only diff engine; every step is its exact `compare_versions` output for one pair (Day 27 never re-derives states or scores)
+- Day 25 provides the selection validation rules Day 27 mirrors exactly (same messages for empty, malformed, non-positive, and duplicate lists)
+- Day 24 readiness states and Day 21 scores are never recomputed or altered in this layer
+- The timeline result is never persisted anywhere (no second store, no cache)
+
+### Timeline Steps
+
+- `steps == len(versions_analyzed) - 1` (0 when a video has zero or one selected version)
+- Step `i` compares `versions_analyzed[i]` (A) with `versions_analyzed[i+1]` (B), always in selection order
+- Adjacent steps chain: a step's `version_b` is always the next step's `version_a`
+- Each step's keys are exactly Day 26's 12 response keys, and each step equals the Day 26 endpoint's response byte-for-byte
+
+Example timeline shape (one exact Day 26 object per consecutive pair):
+
+```json
+{
+  "video_filename": "abc123.mp4",
+  "versions_analyzed": [1, 2],
+  "steps": 1,
+  "timeline": [
+    {
+      "video_filename": "abc123.mp4",
+      "version_a": {"version": 1, "source": "advanced_prompt", "operation": "generate", "readiness_status": "ready", "required_coverage_percentage": 100},
+      "version_b": {"version": 2, "source": "custom", "operation": "", "readiness_status": "needs_attention", "required_coverage_percentage": 86},
+      "dimensions": ["9 entries in Day 21 order"],
+      "changed_dimensions": ["camera"],
+      "dimensions_changed": 1,
+      "dimensions_unchanged": 8,
+      "required_changes": ["camera"],
+      "supporting_changes": [],
+      "transitions": [{"dimension": "camera", "from": "present", "to": "weak"}],
+      "transition_summary": {"missing_to_weak": 0, "missing_to_present": 0, "weak_to_missing": 0, "weak_to_present": 0, "present_to_missing": 0, "present_to_weak": 1},
+      "required_coverage": {"version_a": 100, "version_b": 86, "delta": -14}
+    }
+  ],
+  "summary": {"...": "12 keys, listed below"}
+}
+```
+
+### Selection Rules
+
+- No `versions` query: every live version, ascending version order
+- `?versions=1,3,5`: only those versions, in the requested order - never sorted automatically, never substituted; a deleted or nonexistent requested version -> 404 (Day 16's exact message)
+- Selection validation is byte-identical to Day 25: empty, malformed, non-integer, non-positive, or duplicate entries -> 422; whitespace around entries is tolerated; repeated `?versions=1&versions=3` equals `?versions=1,3`
+- Default selection after a deletion simply skips deleted versions and compares the remaining neighbors (with version 3 deleted: pairs are 1->2, 2->4, 4->5, ...)
+
+### Summary (12 keys)
+
+```json
+{
+  "versions_analyzed": 8,
+  "steps": 7,
+  "dimensions_changed_total": 21,
+  "dimensions_unchanged_total": 42,
+  "required_changes_total": 17,
+  "supporting_changes_total": 4,
+  "transition_summary": {"missing_to_weak": 0, "missing_to_present": 9, "weak_to_missing": 2, "weak_to_present": 0, "present_to_missing": 7, "present_to_weak": 3},
+  "first_version": 1,
+  "last_version": 8,
+  "first_required_coverage_percentage": 100,
+  "last_required_coverage_percentage": 86,
+  "required_coverage_delta": -14
+}
+```
+
+- `transition_summary` is the element-wise sum of every step's six-key transition summary (all six keys are always present)
+- `first_version` / `last_version` are the selection's first and last entries (`null` for an empty timeline)
+- Coverage for a single selected version comes from Day 26's same-version comparison (`compare_versions(v, v)`); both coverage fields are `null` for zero versions
+- `required_coverage_delta = last - first`, always equal to the sum of every step's `required_coverage.delta` (telescoping)
+
+### Chaining Invariants
+
+- `dimensions_changed_total + dimensions_unchanged_total == steps * 9`
+- `required_changes_total + supporting_changes_total == dimensions_changed_total`
+- `sum(transition_summary.values()) == dimensions_changed_total`
+- `required_coverage_delta == sum(step required_coverage delta) == last_required_coverage_percentage - first_required_coverage_percentage`
+- Every total equals the element-wise sum of the steps it aggregates (never independently recomputed)
+
+### Service
+
+`backend/app/services/prompt_readiness_timeline_service.py` - `PromptReadinessTimelineService(history_service, readiness_change_service)`
+
+- `build_timeline(stored_filename, versions=None)` returns `video_filename`, `versions_analyzed`, `steps`, `timeline`, `summary`
+- Raises `ValueError` for an invalid versions list (same three messages as Day 25) or a missing/deleted version (Day 16's message); the route maps these to 404
+- Exactly two dependencies: the Day 16 store and the Day 26 diff service (never a second store)
+
+### Endpoint
+
+```
+GET /api/videos/{stored_filename}/prompt/history/readiness/timeline?versions=1,3,5
+```
+
+- Static route registered before numeric `{version}` routes so it can never collide with them; distinct from Day 25's `/prompt/history/readiness` and Day 26's `/compare/{version_a}/{version_b}/readiness`
+- Valid request -> HTTP 200; malformed/empty/duplicate/non-positive `versions` -> 422; nonexistent or deleted version -> 404; nonexistent video -> 404; invalid extension -> 400; path traversal -> 404; a video with no saved versions -> 200 with an empty timeline (`steps: 0`, `timeline: []`, null coverages, zero totals)
+
+### Determinism and Read-Only Behavior
+
+- Repeated calls return byte-equivalent responses; no timestamps, UUIDs, random values, network, or filesystem data
+- History records, prompts, favorites, tags, exports, and quality reports are byte-identical before and after any timeline request
+- The timeline never creates, deletes, or renumbers versions, and never saves its own result
+- No prompt text, filesystem paths, internal objects, or secrets appear in any response
+
+### Limitations
+
+- Informational chain only: it does not evaluate cinematography, aesthetics, or actual video content, and never predicts which prompt will generate better video
+- Coverage deltas are arithmetic differences between independently computed coverages, not quality measurements; a positive or negative delta is never labeled an improvement or a regression
+- A dimension counted as changed means the Day 24 state changed between those two versions (Day 26's exact rule), nothing more
+- The timeline only ever compares consecutive selected versions; it never searches for a preferred pair
+
+### Tests
+
+- `tests/test_prompt_readiness_timeline_service.py` - 191 service tests (wiring and no-second-store checks, response structure, full 8-version chain verified against direct Day 26 outputs, selection subsets and requested order, validation messages, empty/single-version cases, aggregation invariants and telescoping delta across 7 selections, determinism, read-only integrity, no-ranking/no-leak scans, source contract)
+- `tests/test_prompt_readiness_timeline_api.py` - 78 API tests (200/422/404/400 validation matrix, `versions` query parsing, every step byte-equal to the Day 26 endpoint, Day 21 ordering, determinism, integrity, route collision, Day 16-26 regressions, leak scans)
+
+### Files Created/Modified
+
+- `backend/app/services/prompt_readiness_timeline_service.py` - `PromptReadinessTimelineService`
+- `backend/app/api/videos.py` - Added import, service instance, and static `GET .../prompt/history/readiness/timeline` route (registered before numeric `{version}` routes)
+- `tests/test_prompt_readiness_timeline_service.py` - 191 service tests
+- `tests/test_prompt_readiness_timeline_api.py` - 78 API tests
+
+## Day 28 - Prompt Readiness Snapshot
+
+Day 28 adds **Prompt Readiness Snapshot**: a deterministic, read-only service that answers one question for a saved prompt version - *"what is this version's current production readiness state, and how do the selected versions look in aggregate?"* Every per-version readiness block is produced by Day 24's exact `validate_prompt` result, every favorite/tag flag is Day 17's exact `get_organization` result, and Day 28 only assembles those values into a stable response shape plus neutral counts. It never ranks versions, never picks a best version, and never predicts which prompt will generate better video. This is not an LLM feature; no external AI/API/model is called.
+
+### Purpose
+
+- Produce one readiness snapshot per selected saved version: version metadata, Day 24 readiness states and raw scores, Day 17 favorite and tags
+- Aggregate the selected snapshots into neutral counts: ready/needs-attention totals, required and supporting coverage sums, a nine-dimension summary, and favorite/tag counts
+- Keep every per-version readiness block byte-equal to calling the Day 24 endpoint for that version directly
+- Keep every favorite and tag flag byte-equal to calling the Day 17 organization endpoint for that version directly
+- Reuse Day 16's single store read-only - no second store, no cache, no persisted snapshot
+
+### Relationship With Day 16/17/21/24/25
+
+- Day 16 `PromptHistoryService` is still the only version store; Day 28 calls only `list_versions` (default selection) and `get_version` (explicit selection), both read-only
+- Day 24 `PromptReadinessService.validate_prompt` is the only readiness engine; Day 28 never recomputes states, scores, checklists, or coverage itself
+- Day 17 `PromptOrganizationService.get_organization` is the only favorite/tag source; a version with no organization record yields `{"favorite": false, "tags": []}` (Day 17's default)
+- Day 21 dimension order (7 required + 2 supporting) is preserved everywhere: `required`, `supporting`, `missing_dimensions`, `weak_dimensions`, and `dimension_summary`
+- Day 25 provides the selection validation rules Day 28 mirrors exactly (same messages for empty, malformed, non-positive, and duplicate lists)
+- The snapshot result is never persisted anywhere (no second store, no cache)
+
+### Per-Version Snapshots
+
+- One entry per selected version, in selection order, with exactly 7 keys: `version`, `source`, `operation`, `created_at`, `favorite`, `tags`, `readiness`
+- `source`, `operation`, and `created_at` are the stored Day 16 record metadata (allowed); `favorite` and `tags` come from Day 17; nothing is invented
+- Each `readiness` block has exactly 6 keys: `status`, `required_coverage_percentage`, `required` (7 dimensions), `supporting` (2 dimensions), `missing_dimensions`, `weak_dimensions`
+- Each dimension maps to `{status, score}` exactly as Day 24's checklist produced it (statuses: `present`, `weak`, `missing`)
+
+Example snapshot entry:
+
+```json
+{
+  "version": 2,
+  "source": "custom",
+  "operation": "",
+  "created_at": "2026-09-30T11:51:44.969917+00:00",
+  "favorite": false,
+  "tags": ["cinematic"],
+  "readiness": {
+    "status": "needs_attention",
+    "required_coverage_percentage": 86,
+    "required": {"subject": {"status": "present", "score": 100}, "action": {"status": "present", "score": 100}, "environment": {"status": "present", "score": 100}, "camera": {"status": "weak", "score": 40}, "lighting": {"status": "present", "score": 100}, "visual_style": {"status": "present", "score": 100}, "composition": {"status": "present", "score": 100}},
+    "supporting": {"color": {"status": "present", "score": 100}, "audio": {"status": "present", "score": 100}},
+    "missing_dimensions": [],
+    "weak_dimensions": ["camera"]
+  }
+}
+```
+
+### Selection Rules
+
+- No `versions` query: every live version, ascending version order
+- `?versions=1,3,5`: only those versions, in the requested order - never sorted automatically, never substituted; a deleted or nonexistent requested version -> 404 (Day 16's exact message)
+- Selection validation is byte-identical to Day 25: empty, malformed, non-integer, non-positive, or duplicate entries -> 422; whitespace around entries is tolerated; repeated `?versions=1&versions=3` equals `?versions=1,3`
+- Default selection after a deletion simply skips deleted versions; an explicitly requested deleted version -> 404
+
+### Summary (7 keys)
+
+```json
+{
+  "versions_analyzed": 5,
+  "ready_count": 1,
+  "needs_attention_count": 4,
+  "required": {"total": 35, "present": 20, "weak": 2, "missing": 13, "coverage_percentage": 57},
+  "supporting": {"total": 10, "present": 6, "weak": 0, "missing": 4},
+  "dimension_summary": [{"dimension": "subject", "present": 3, "weak": 1, "missing": 1}, "...": "9 rows in Day 21 order"],
+  "organization": {"favorite_count": 1, "tag_counts": {"ai": 1, "cinematic": 1, "final": 1}}
+}
+```
+
+- `ready_count + needs_attention_count == versions_analyzed`; required totals are `N x 7`, supporting totals are `N x 2`
+- `required.coverage_percentage = round(present / total * 100)` (`null` when total is 0); each `dimension_summary` row sums to N
+- `organization.favorite_count` counts selected versions currently favorited; `organization.tag_counts` maps each selected tag to how many selected versions carry it (alphabetical keys, each version counted once per tag)
+
+### Service
+
+`backend/app/services/prompt_readiness_snapshot_service.py` - `PromptReadinessSnapshotService(history_service, readiness_service, organization_service)`
+
+- `create_snapshot(stored_filename, versions=None)` returns `video_filename`, `versions_analyzed`, `snapshots`, `summary`
+- Raises `ValueError` for an invalid versions list (same three messages as Day 25) or a missing/deleted version (Day 16's message); the route maps these to 404
+- Exactly three dependencies: the Day 16 store, the Day 24 readiness service, and the Day 17 organization service (never a second store, never Day 25/26/27 services)
+
+### Endpoint
+
+```
+GET /api/videos/{stored_filename}/prompt/history/readiness/snapshot?versions=1,3,5
+```
+
+- Static route registered before numeric `{version}` routes so it can never collide with them; distinct from Day 24's `/prompt/history/{version}/readiness`, Day 25's `/prompt/history/readiness`, Day 26's `/compare/{version_a}/{version_b}/readiness`, and Day 27's `/prompt/history/readiness/timeline`
+- Valid request -> HTTP 200; malformed/empty/duplicate/non-positive `versions` -> 422; nonexistent or deleted version -> 404; nonexistent video -> 404; invalid extension -> 400; path traversal -> 404; a video with no saved versions -> 200 with an empty snapshot (`snapshots: []`, `versions_analyzed: []`, all-zero counts, `null` coverage, `dimension_summary: []`)
+- A single selected version aggregates to exactly its own Day 24 result (required total 7, supporting total 2)
+
+### Determinism and Read-Only Behavior
+
+- Repeated calls return byte-equivalent responses; no random IDs or generated timestamps (only stored Day 16 `created_at` values)
+- History records, prompts, favorites, tags, exports, and quality reports are byte-identical before and after any snapshot request
+- The snapshot never creates, deletes, or renumbers versions, and never saves its own result
+- No prompt text, filesystem paths, internal objects, or secrets appear in any response
+
+### Limitations
+
+- Informational assembly only: it does not evaluate cinematography, aesthetics, or actual video content, and never predicts which prompt will generate better video
+- `ready` / `needs_attention` are Day 24 threshold labels restated, not judgments about video quality; counts are arithmetic sums, never scores or grades
+- `favorite_count` and `tag_counts` are neutral tallies - a favorited version is not thereby "better", and tag frequency is not a recommendation
+- The snapshot reflects only the selected versions; aggregates change with selection and are never comparable across different selections as rankings
+
+### Tests
+
+- `tests/test_prompt_readiness_snapshot_service.py` - 172 service tests (wiring and no-second-store checks, response structure, Day 24 exact cross-checks with raw-score spot checks, selection subsets and requested order, validation messages, empty/single-version cases, aggregate and dimension invariants across 8 selections, organization counts, determinism, read-only integrity, no-ranking/no-leak scans, source contract)
+- `tests/test_prompt_readiness_snapshot_api.py` - 75 API tests (200/422/404/400 validation matrix, `versions` query parsing, per-version equality with Day 24 and Day 17 endpoints, aggregate equality with Day 25, dimension and organization verification, empty/single-version videos, determinism, integrity, route collision, Day 16-27 regressions, leak scans)
+
+### Files Created/Modified
+
+- `backend/app/services/prompt_readiness_snapshot_service.py` - `PromptReadinessSnapshotService`
+- `backend/app/api/videos.py` - Added import, service instance, and static `GET .../prompt/history/readiness/snapshot` route (registered before numeric `{version}` routes)
+- `tests/test_prompt_readiness_snapshot_service.py` - 172 service tests
+- `tests/test_prompt_readiness_snapshot_api.py` - 75 API tests
+- `backend/day28_e2e.py` - manual end-to-end verification script
+
+## Day 29 - Prompt Readiness Report
+
+Day 29 adds **Prompt Readiness Report**: a deterministic, read-only orchestration layer that combines existing readiness information into one structured report for a video, answering one question - *"what does the complete readiness report for these saved versions look like?"* The report carries the exact Day 28 per-version snapshots and aggregate summary, the exact Day 27 timeline steps and totals, and deterministic report metadata. It never ranks versions, never chooses a best or worst version, never recommends a version, never calls any number an improvement, and never predicts which prompt will generate better video. This is not an LLM feature; no external AI/API/model is called.
+
+### Purpose
+
+- Produce one structured report per selection: report metadata, per-version Day 24 readiness (via Day 28 snapshots), the Day 27 timeline of consecutive Day 26 diffs, and the Day 28 aggregate summary
+- Keep every section byte-equal to the existing service output it reuses (Day 24/17 per version via Day 28, Day 26/27 for timeline steps, Day 28 for aggregation)
+- Support the exact Day 25 `versions` selection semantics (requested order preserved, never substituted or reordered)
+- Reuse the single Day 16 store read-only - no second store, no cache, no persisted report
+
+### Report Structure (5 top-level keys)
+
+```json
+{
+  "video_filename": "abc123.mp4",
+  "versions_analyzed": [1, 3, 5],
+  "report": {"...": "metadata + per-version snapshots, listed below"},
+  "timeline": {"...": "Day 27 steps + neutral totals, listed below"},
+  "summary": {"...": "the exact Day 28 aggregate summary"}
+}
+```
+
+### Report Metadata
+
+```json
+{
+  "type": "prompt_readiness_report",
+  "version_count": 4,
+  "first_version": 1,
+  "last_version": 5,
+  "selection_order": [1, 3, 4, 5],
+  "snapshots": ["the exact Day 28 snapshot entries for the selection"]
+}
+```
+
+- `type` is a fixed literal; `version_count`, `first_version`, `last_version`, and `selection_order` are derived only from the selected version numbers (first/last are `null` for an empty selection)
+- `snapshots` is byte-equal to the Day 28 endpoint's `snapshots` list: each entry carries `version`, `source`, `operation`, `created_at` (stored Day 16 metadata), Day 17 `favorite`/`tags`, and the Day 24 readiness block (`status`, `required_coverage_percentage`, `required` 7 dimensions, `supporting` 2 dimensions, `missing_dimensions`, `weak_dimensions`) with raw Day 21 scores
+- No report UUID, no creation timestamp, no random ID is ever generated - the report is a pure function of stored data
+
+### Day 24/25/26/27/28 Reuse
+
+- Day 28 `PromptReadinessSnapshotService` supplies `summary` and `report.snapshots` unchanged (it already holds the Day 16 store, Day 24 readiness service, and Day 17 organization service)
+- Day 27 `PromptReadinessTimelineService` supplies `timeline.steps` and the timeline totals unchanged (it already holds the Day 16 store and the Day 26 change service)
+- Both delegated services share one Day 16 store and apply identical Day 25 selection semantics, so their selections always agree; the report service itself holds only these two dependencies (minimal dependency graph)
+- Day 24 readiness rules, Day 25 selection/aggregation, Day 26 transition semantics, Day 27 timeline semantics, and Day 28 snapshot semantics are never re-implemented or altered in this layer
+
+### Timeline Section (7 keys)
+
+```json
+{
+  "steps": ["one byte-equal Day 26 comparison per consecutive pair"],
+  "changed_dimensions": 21,
+  "unchanged_dimensions": 42,
+  "required_changes": 17,
+  "supporting_changes": 4,
+  "transition_summary": {"missing_to_weak": 0, "missing_to_present": 9, "weak_to_missing": 2, "weak_to_present": 0, "present_to_missing": 7, "present_to_weak": 3},
+  "required_coverage_delta": -14
+}
+```
+
+- `steps` is byte-equal to the Day 27 endpoint's `timeline` list; the four counts and `transition_summary` are Day 27's summary totals; steps follow selection order (e.g. `versions=4,2,5` yields steps `4->2` and `2->5`, never resorted)
+- `required_coverage_delta` equals the sum of every step's coverage delta, and for N >= 2 equals `coverage(last selected) - coverage(first selected)` (arithmetic only); it is `0` for a single selected version and `null` for zero versions
+
+### Summary (7 keys)
+
+The exact Day 28 aggregate: `versions_analyzed`, `ready_count`, `needs_attention_count`, `required` {total N x 7, present, weak, missing, coverage_percentage}, `supporting` {total N x 2, present, weak, missing}, `dimension_summary` (9 rows in Day 21 order, each row summing to N), and `organization` {favorite_count, tag_counts in alphabetical order, each tag counted at most once per version}.
+
+### Selection Rules
+
+- No `versions` query: every live version, ascending version order
+- `?versions=1,3,5`: only those versions, in the requested order - never sorted automatically, never substituted; a deleted or nonexistent requested version -> 404 (Day 16's exact message)
+- Selection validation is byte-identical to Day 25: empty, malformed, non-integer, non-positive, or duplicate entries -> 422; whitespace around entries is tolerated; repeated `?versions=1&versions=3` equals `?versions=1,3`
+
+### Endpoint
+
+```
+GET /api/videos/{stored_filename}/prompt/history/readiness/report?versions=1,3,5
+```
+
+- Static route registered before numeric `{version}` routes so it can never collide with them; distinct from Day 24's `/prompt/history/{version}/readiness`, Day 25's `/prompt/history/readiness`, Day 26's `/compare/{version_a}/{version_b}/readiness`, Day 27's `/prompt/history/readiness/timeline`, and Day 28's `/prompt/history/readiness/snapshot`
+- Valid request -> HTTP 200; malformed/empty/duplicate/non-positive `versions` -> 422; nonexistent or deleted version -> 404; nonexistent video -> 404; invalid extension -> 400; path traversal -> 404; a video with no saved versions -> 200 with an empty report (`versions_analyzed: []`, metadata nulls, zero timeline counts with `null` delta, all-zero summary with `null` coverage and empty `dimension_summary`)
+- A single selected version yields `version_count: 1`, an empty zero-step timeline with delta `0`, and a summary exactly matching that version
+
+### Determinism and Read-Only Behavior
+
+- Repeated calls return byte-equivalent responses; no generated timestamps, UUIDs, or random values (only stored Day 16 `created_at` values)
+- History records, prompts, favorites, tags, exports, and quality reports are byte-identical before and after any report request
+- The report never creates, deletes, or renumbers versions, and never saves its own result
+- No prompt text, filesystem paths, internal objects, or secrets appear in any response
+
+### Limitations
+
+- Informational aggregation only: it does not evaluate cinematography, aesthetics, or actual video content, and never predicts which prompt will generate better video
+- `ready`/`needs_attention` counts, coverage values, and timeline deltas are Day 24/26 arithmetic restated, never judgments, grades, or labels like improvement or regression
+- Favorite and tag counts are neutral tallies - a favorited version is not thereby preferred, and tag frequency is not a recommendation
+- The report reflects only the selected versions; aggregates change with selection and are never comparable across different selections as rankings
+
+### Tests
+
+- `tests/test_prompt_readiness_report_service.py` - 210 service tests (wiring and single-store checks, response structure, Day 24/17/26/27/28 byte-equivalence, selection subsets and requested order, timeline and summary invariants with coverage telescoping, organization counts, empty/single-version cases, validation messages, determinism, read-only integrity, no-ranking/no-leak scans, source contract)
+- `tests/test_prompt_readiness_report_api.py` - 85 API tests (200/422/404/400 validation matrix, `versions` query parsing, Day 24/27/28 endpoint equivalence, aggregates, empty/single-version videos, determinism, integrity, route collision, Day 16-28 regressions, leak scans)
+
+### Files Created/Modified
+
+- `backend/app/services/prompt_readiness_report_service.py` - `PromptReadinessReportService`
+- `backend/app/api/videos.py` - Added import, service instance, and static `GET .../prompt/history/readiness/report` route (registered before numeric `{version}` routes)
+- `tests/test_prompt_readiness_report_service.py` - 210 service tests
+- `tests/test_prompt_readiness_report_api.py` - 85 API tests
+- `backend/day29_e2e.py` - manual end-to-end verification script
+
+## Day 30 - Prompt Readiness Report Export
+
+Day 30 adds **Prompt Readiness Report Export**: deterministic, read-only serialization of the existing Day 29 Prompt Readiness Report into downloadable JSON, Markdown, or plain text. The export represents the Day 29 report exactly - it never alters report data, never rebuilds any readiness calculation, and never persists anything to disk. This is not an LLM feature; no external AI/API/model is called.
+
+### Purpose
+
+- Serialize one Day 29 report (metadata, per-version snapshots, timeline, aggregate summary) in three human- and machine-readable formats
+- Reuse `PromptReadinessReportService` unchanged: no duplicate Day 24 readiness, Day 25 aggregation, Day 26 transitions, Day 27 timeline, or Day 28 snapshot logic exists in the export layer
+- Keep output fully deterministic: the same stored selection always produces byte-identical content and the same filename
+
+### Supported Formats
+
+| Format | Media type | Filename |
+|---|---|---|
+| `json` | `application/json` | `visionprompt_readiness_report.json` |
+| `markdown` | `text/markdown` | `visionprompt_readiness_report.md` |
+| `txt` | `text/plain` | `visionprompt_readiness_report.txt` |
+
+- Any other format value (including empty or wrong-case like `JSON`) -> HTTP 422 with Day 19's exact message: `Invalid format. Must be one of: json, markdown, txt`
+- All content is UTF-8; responses carry `Content-Disposition: attachment; filename=...` and are streamed directly from memory (no file is written anywhere)
+
+### JSON Structure
+
+JSON serializes the complete Day 29 report - all five top-level keys (`video_filename`, `versions_analyzed`, `report`, `timeline`, `summary`) and every nested field, with no fields omitted or invented:
+
+```json
+{
+  "video_filename": "...",
+  "versions_analyzed": [1, 3, 5],
+  "report": {"type": "...", "version_count": 3, "first_version": 1, "last_version": 5, "selection_order": [1, 3, 5], "snapshots": ["..."]},
+  "timeline": {"steps": ["..."], "changed_dimensions": ..., "unchanged_dimensions": ..., "required_changes": ..., "supporting_changes": ..., "transition_summary": {"...": 0}, "required_coverage_delta": -86},
+  "summary": {"versions_analyzed": ..., "ready_count": ..., "needs_attention_count": ..., "required": {"...": ...}, "supporting": {"...": ...}, "dimension_summary": ["..."], "organization": {"favorite_count": ..., "tag_counts": {"...": ...}}}
+}
+```
+
+- Deterministic formatting: UTF-8, `indent=2`, stable key order (report dict order), trailing newline, no random values
+- `json.loads(json_export) == GET .../readiness/report` for every selection (semantically and structurally equivalent)
+
+### Markdown Structure
+
+Human-readable `# Prompt Readiness Report` document with four `##` sections, containing all report information as factual data only:
+
+- `## Report` - video filename, type, versions analyzed, version count, first/last version, selection order
+- `## Version Readiness` - one `### Version N` block per snapshot: source, operation, created at, favorite, tags, status, required coverage, `#### Required Dimensions` table (7 rows), `#### Supporting Dimensions` table (2 rows), missing/weak dimension lists
+- `## Timeline` - one `### Step i: Version A -> Version B` block per consecutive pair (versions A/B metadata, changed/unchanged counts, required/supporting changes, per-dimension `#### Step Dimensions` table, `#### Transitions`, `#### Transition Summary`), plus `### Timeline Summary` (changed/unchanged totals, required/supporting change totals, transition summary, required coverage delta)
+- `## Summary` - `### Readiness`, `### Required`, `### Supporting` counts, `### Dimension Summary` table (9 rows in Day 21 order), `### Organization` (favorite count, tag counts alphabetically)
+
+No evaluative commentary is ever written - only the report's own values.
+
+### TXT Structure
+
+Plain-text equivalent with `PROMPT READINESS REPORT` title and underlined `REPORT`, `VERSION READINESS`, `TIMELINE`, `SUMMARY` sections. Each version appears as a `VERSION N` block with `REQUIRED DIMENSIONS` / `SUPPORTING DIMENSIONS` lines (`dimension: status (score)`), timeline steps use ASCII `->` arrows with `STEP DIMENSIONS`, `TRANSITIONS`, `TRANSITION SUMMARY`, `TIMELINE SUMMARY` blocks, and the summary carries `DIMENSION SUMMARY` / `ORGANIZATION` blocks. Same factual information as Markdown; no prompt text, no internal objects, no absolute paths, no secrets.
+
+### Selection Semantics
+
+Byte-identical to Day 25/27/28/29 (delegated, never reimplemented):
+
+- No `versions` query: every live version, ascending version order
+- `?versions=1,3,5`: only those versions, in the requested order - never sorted, never substituted
+- Repeated `?versions=1&versions=3` equals `?versions=1,3`; whitespace around entries tolerated
+- Empty, malformed, non-integer, non-positive, or duplicate entries -> 422; missing or deleted version -> 404 (Day 16's exact message); nonexistent video -> 404; invalid extension -> 400; path traversal -> 404
+- A video with no saved versions exports an empty report with HTTP 200 (zero counts, `null` coverage/delta in JSON, `No saved versions.` in Markdown/TXT)
+
+### Filenames and Media Types
+
+- Stable filenames only: `visionprompt_readiness_report.json` / `.md` / `.txt` - never derived from user input, never contain random IDs or version lists
+- Media types as listed in the table above; responses are `Content-Disposition: attachment` downloads rendered in memory
+
+### Determinism
+
+- Repeated export calls (any format, any selection) produce byte-identical content, `Content-Type`, and `Content-Disposition`
+- No generated timestamps, UUIDs, or random values: the only time values are each snapshot's stored Day 16 `created_at`
+
+### Read-Only Behavior
+
+- Export never modifies prompt history, favorites, tags, quality results, Day 19 prompt exports, or Day 20 packages; never creates, deletes, or renumbers versions
+- No filesystem persistence: nothing is written to storage (or anywhere else); no second store, no cache, no saved export results
+- The Day 29 report service is called read-only; its output is rendered to a string and returned
+
+### Limitations
+
+- Serialization only: it does not recompute, reinterpret, or extend readiness data, and never evaluates which version is better/worse or recommends a version
+- Markdown/TXT present every report value as neutral text; they carry no analysis beyond what Day 29 already reports
+- Exports reflect only the selected versions and are identical in content to the report endpoint for the same selection
+
+### Endpoint
+
+```
+GET /api/videos/{stored_filename}/prompt/history/readiness/report/export?format=json[&versions=1,3,5]
+```
+
+- Static route registered before numeric `{version}` routes; distinct from Day 19's `.../{version}/export` and Day 29's `.../readiness/report`
+- Query: `format` required (`json` | `markdown` | `txt`), `versions` optional (same rules as Day 29)
+- 200 with rendered content + media type + filename; 422 invalid format or versions; 404 missing/deleted version or unknown video; 400 invalid extension
+
+### Tests
+
+- `tests/test_prompt_readiness_export_service.py` - 450 service tests (wiring/single-store, envelope, JSON structure and Day 29 equivalence, Markdown structure and leaf completeness, TXT structure and leaf completeness, empty history, single version, selection, validation messages, determinism, read-only integrity, no-ranking/leak scans, source contract)
+- `tests/test_prompt_readiness_export_api.py` - 208 API tests (200s, media types, Content-Disposition, semantic equivalence with Day 29, selections, repeated/whitespace params, empty/single, full validation matrix, determinism, read-only/no-file checks, route collision, Day 16-29 regression, leak scans)
+
+### Files Created/Modified
+
+- `backend/app/services/prompt_readiness_export_service.py` - `PromptReadinessExportService`
+- `backend/app/api/videos.py` - Added import, service instance, and static `GET .../prompt/history/readiness/report/export` route (registered before numeric `{version}` routes)
+- `tests/test_prompt_readiness_export_service.py` - 450 service tests
+- `tests/test_prompt_readiness_export_api.py` - 208 API tests
+- `backend/day30_e2e.py` - manual end-to-end verification script
+
+## Phase 2 - Advanced Video Intelligence
+
+Phase 2 extends the MVP with advanced, provider-aware analysis features implemented strictly in order (P2-01 through P2-13). Every feature reuses the existing service layer, keeps a single source of truth, never fabricates AI output, distinguishes observed vs estimated vs unavailable information, and reports explicit provider status with confidence/uncertainty.
+
+### P2-01 - Video-to-Video Prompt Reconstruction
+
+- Reconstructs a structured analysis report and a production-ready prompt directly from a stored video - no saved prompt required
+- Reuses Day 12 unified intelligence, Day 13 advanced prompt generation, Day 21 quality, and Day 24 readiness; reserves slots for P2-02..P2-06 services (wired in later phases)
+- Every one of the 12 analysis domains (shots, subjects, actions, environment, camera, lens, lighting, color, composition, visual_style, audio, characters) reports availability as `observed`, `estimated`, or `unavailable` with source, confidence, and note
+- AI safety: empty intelligence fields become explicit `unavailable` blocks with notes - no invented visual details; `provider_status` surfaces configured vision/audio providers (local mock by default) and mock usage appears in `confidence.uncertainty_notes`
+- `confidence` partitions all 12 domains into observed/estimated/unavailable lists with an overall rating (high <= 2 unavailable, medium <= 6, low otherwise)
+- Deterministic: same video + params produce identical output; read-only - no prompt history, favorites, or storage side effects
+
+### Endpoint
+
+```
+POST /api/videos/{stored_filename}/prompt/reconstruct?depth=standard&style=cinematic
+```
+
+- Query: `depth` (`quick` | `standard` | `deep` - maps to 2/10/25 analyzed frames, default standard), `style` (`cinematic` | `realistic` | `commercial`, default cinematic)
+- 200 with success envelope + video_information + analysis + provider_status + confidence + prompt + quality + readiness; 400 invalid depth/style/filename; 404 missing video
+- Static path segment; no conflict with numeric `{version}` routes
+
+### Tests
+
+- `tests/test_video_reconstruction_service.py` - 101 service tests (validation and order, depth-to-frame mapping, result shape, rich/sparse intelligence honesty, audio notes, provider status, confidence summary boundaries, optional service wiring, upstream error propagation, determinism, no-leak/no-side-effect, real stack)
+- `tests/test_video_reconstruction_api.py` - 56 API tests (happy path, full validation matrix, response structure, AI-safety unavailable blocks, style wording, determinism, read-only storage/history/favorites, multi-video isolation, Day 1-30 regression)
+
+### Files Created/Modified
+
+- `backend/app/services/video_reconstruction_service.py` - `VideoReconstructionService` with `reconstruct()`, `VALID_DEPTHS`, `DEPTH_MAX_FRAMES`
+- `backend/app/api/videos.py` - Added import, `reconstruction_service` instance, and `POST .../prompt/reconstruct` route
+- `tests/test_video_reconstruction_service.py` - 101 service tests
+- `tests/test_video_reconstruction_api.py` - 56 API tests
+- `backend/phase2_e2e.py` - progressive Phase 2 manual E2E script (MVP regression + P2-01..P2-13 sections)

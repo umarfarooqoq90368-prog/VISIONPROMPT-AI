@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_subjects: int = 100
     audio_provider: str = "mock"
     audio_model_name: str = "small"
+    api_key_value: str = ""
 
     model_config = ConfigDict(env_file=".env")
 

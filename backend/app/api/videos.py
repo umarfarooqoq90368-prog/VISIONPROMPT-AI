@@ -44,7 +44,28 @@ from app.services.prompt_readiness_history_service import (
 from app.services.prompt_readiness_change_service import (
     PromptReadinessChangeService,
 )
+from app.services.prompt_readiness_timeline_service import (
+    PromptReadinessTimelineService,
+)
+from app.services.prompt_readiness_snapshot_service import (
+    PromptReadinessSnapshotService,
+)
+from app.services.prompt_readiness_report_service import (
+    PromptReadinessReportService,
+)
+from app.services.prompt_readiness_export_service import (
+    PromptReadinessExportService,
+)
+from app.services.video_reconstruction_service import (
+    VideoReconstructionService,
+    VALID_DEPTHS,
+)
 from app.utils.ffprobe import extract_metadata
+from app.ai.shot_providers import collect_frames
+from app.services.shot_detection_service import ShotDetectionService
+from app.services.camera_estimation_service import CameraEstimationService
+from app.services.color_analysis_service import ColorAnalysisService
+from app.services.reference_analysis_service import ReferenceAnalysisService, REFERENCE_CHARACTER, REFERENCE_APPEARANCE, REFERENCE_STYLE, REFERENCE_COMPOSITION
 
 router = APIRouter()
 
@@ -55,6 +76,7 @@ vision_service = VisionService()
 analysis_service = VideoAnalysisService()
 prompt_service = PromptGenerationService()
 scene_service = SceneDetectionService()
+shot_detection_service = ShotDetectionService()
 subject_service = SubjectTrackingService()
 audio_service = AudioService()
 intelligence_service = IntelligenceService()
@@ -79,6 +101,25 @@ readiness_history_service = PromptReadinessHistoryService(
 )
 readiness_change_service = PromptReadinessChangeService(
     prompt_history_service, readiness_service
+)
+readiness_timeline_service = PromptReadinessTimelineService(
+    prompt_history_service, readiness_change_service
+)
+readiness_snapshot_service = PromptReadinessSnapshotService(
+    prompt_history_service, readiness_service, organization_service
+)
+readiness_report_service = PromptReadinessReportService(
+    readiness_timeline_service, readiness_snapshot_service
+)
+readiness_report_export_service = PromptReadinessExportService(
+    readiness_report_service
+)
+reconstruction_service = VideoReconstructionService(
+    intelligence_service=intelligence_service,
+    advanced_prompt_service=advanced_prompt_service,
+    quality_service=quality_service,
+    readiness_service=readiness_service,
+    shot_detection_service=shot_detection_service,
 )
 
 
@@ -476,6 +517,249 @@ async def detect_scenes(
         "duration_seconds": result["duration_seconds"],
         "scenes_detected": result["scenes_detected"],
         "scenes": result["scenes"],
+    }
+
+
+@router.post("/videos/{stored_filename}/shots/detect")
+async def detect_shots(
+    stored_filename: str = FastPath(...),
+    sample_interval_seconds: float = Query(default=1.0, gt=0),
+    threshold: float = Query(default=0.40, ge=0, le=1),
+    max_shots: int = Query(default=100, ge=1, le=100),
+):
+    """Detect shot boundaries in an uploaded video using extracted frames.
+
+    Uses heuristic image comparison (RGB histogram + pixel difference)
+    to identify shot boundaries. Does NOT require AI model inference.
+
+    - sample_interval_seconds: interval between sampled frames (default 1.0)
+    - threshold: visual difference threshold for shot boundary (default 0.40)
+    - max_shots: maximum number of shots to detect (default 100)
+
+    Returns shot boundary metadata including transition types,
+    confidence scores, and motion levels.
+    """
+    try:
+        validate_file_extension(stored_filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video filename.")
+
+    filepath = (STORAGE_DIR / stored_filename).resolve()
+    if not str(filepath).startswith(str(STORAGE_DIR.resolve())) or not filepath.exists():
+        raise HTTPException(status_code=404, detail="Video file not found.")
+
+    video_id = stored_filename.rsplit(".", 1)[0]
+    frame_dir = FRAME_STORAGE_DIR / video_id
+
+    if not frame_dir.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="No extracted frames found for this video. Extract frames first.",
+        )
+
+    frame_files = sorted(f for f in frame_dir.glob("frame_*.jpg") if f.is_file())
+
+    if not frame_files:
+        raise HTTPException(
+            status_code=400,
+            detail="No extracted frames found for this video. Extract frames first.",
+        )
+
+    frame_filenames = []
+    for i, fpath in enumerate(frame_files, start=1):
+        frame_filenames.append(
+            {
+                "index": i,
+                "filename": fpath.name,
+                "timestamp_seconds": round((i - 1) * sample_interval_seconds, 2),
+                "path": str(fpath),
+            }
+        )
+
+    video_duration = round(len(frame_files) * sample_interval_seconds, 2)
+
+    try:
+        result = shot_detection_service.detect_shots(
+            stored_filename=stored_filename,
+            frame_filenames=frame_filenames,
+            video_duration=video_duration,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Shot detection failed.")
+
+    # Assign shot IDs and ensure first shot has no transition from previous
+    shots = result.get("shots", [])
+    for i, shot in enumerate(shots):
+        shot["shot_id"] = i + 1
+        if i == 0:
+            shot["transition_type"] = "None"
+
+    # Ensure no absolute paths in response
+    for shot in shots:
+        for key in ["start_frame", "end_frame", "representative_frame"]:
+            val = shot.get(key, "")
+            if val.startswith("/") or val.startswith("\\"):
+                shot[key] = val.split("\\")[-1].split("/")[-1]
+
+    return {
+        "success": True,
+        "message": "Shot detection completed successfully",
+        "video_filename": stored_filename,
+        "duration_seconds": result["duration_seconds"],
+        "shots_detected": result["shots_detected"],
+        "frames_compared": result["frames_compared"],
+        "shots": result["shots"],
+    }
+
+
+@router.post("/videos/{stored_filename}/camera/estimate")
+async def camera_estimate(
+    stored_filename: str = FastPath(...),
+) -> dict:
+    """Estimate camera and lens parameters from a stored video.
+
+    Uses deterministic heuristics based on video metadata (resolution, duration,
+    frame count). Does NOT require AI model inference.
+
+    Returns a structured estimate with explicit confidence, estimated flag,
+    and documented limitations.
+
+    Example:
+    GET .../camera/estimate?stored_filename=abc123.mp4
+    """
+    try:
+        validate_file_extension(stored_filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video filename.")
+
+    filepath = (STORAGE_DIR / stored_filename).resolve()
+    if not str(filepath).startswith(str(STORAGE_DIR.resolve())) or not filepath.exists():
+        raise HTTPException(status_code=404, detail="Video file not found.")
+
+    estimator = CameraEstimationService()
+    estimate = estimator.estimate(stored_filename)
+
+    return {
+        "success": True,
+        "message": "Camera and lens estimation completed successfully",
+        "video_filename": stored_filename,
+        "estimate": estimate.to_dict(),
+    }
+
+
+@router.post("/videos/{stored_filename}/color/analyze")
+async def color_analyze(
+    stored_filename: str = FastPath(...),
+) -> dict:
+    """Analyze the color palette of a video's extracted frames.
+
+    Uses actual extracted frames to determine dominant colors, palette,
+    and visual color mood. Output is deterministic and based on real pixel data.
+
+    Sample interval defaults to 1 second between frames.
+
+    Example:
+    POST .../color/analyze?stored_filename=abc123.mp4
+
+    Returns:
+        - ``dominant_colors``: List of dominant color dicts with hex, rgb,
+          percentage, brightness, saturation.
+        - ``palette``: Aggregated palette hex -> total percentage.
+        - ``visual_color_mood``: Textual description of overall color character.
+        - ``frame_count``: Number of frames analyzed.
+        - ``method``: Analysis method string.
+        - ``estimated``: Whether the analysis is heuristic/estimated.
+    """
+    try:
+        validate_file_extension(stored_filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video filename.")
+
+    service = ColorAnalysisService()
+    result = service.analyze_color_palette(stored_filename=stored_filename)
+
+    return {
+        "success": True,
+        "message": "Color palette analysis completed successfully",
+        "video_filename": stored_filename,
+        "result": result,
+    }
+
+
+@router.post("/videos/{stored_filename}/reference/analyze")
+async def reference_analyze(
+    stored_filename: str = FastPath(...),
+    reference_image_path: str = Query(..., description="Path to the reference image file"),
+    reference_purpose: str = Query(
+        REFERENCE_APPEARANCE,
+        description="Purpose of the reference image. One of: character, appearance, style, composition",
+    ),
+) -> dict:
+    """Analyze a reference image alongside a video's extracted frames.
+
+    Uses actual reference image to determine consistency with video observations.
+    Clearly separates REFERENCE INFORMATION from VIDEO OBSERVATIONS.
+
+    Args:
+        stored_filename: The stored video filename.
+        reference_image_path: Path to the reference image file.
+        reference_purpose: Purpose of the reference image. One of:
+            REFERENCE_CHARACTER, REFERENCE_APPEARANCE,
+            REFERENCE_STYLE, REFERENCE_COMPOSITION.
+
+    Returns:
+        - ``reference_purpose``: The classified/purpose-specified reference type.
+        - ``reference_info``: Dict with reference image characteristics
+          (dimensions, dominant colors, etc.).
+        - ``video_observations``: Dict with video analysis characteristics
+          (dominant colors, mood, etc.) - separated from reference info.
+        - ``consistency``: Heuristic consistency score (0-1) indicating
+          how well the reference information aligns with video observations.
+        - ``differences`: List of items present in reference but not in video,
+          or vice versa.
+        - ``method``: Analysis method string.
+        - ``estimated``: Whether the analysis is heuristic/estimated.
+    """
+    service = ReferenceAnalysisService()
+    result = service.analyze_reference_image(
+        stored_filename=stored_filename,
+        reference_image_path=reference_image_path,
+        reference_purpose=reference_purpose,
+    )
+
+    return {
+        "success": True,
+        "message": "Reference analysis completed successfully",
+        "video_filename": stored_filename,
+        "result": result,
+    }
+
+
+@router.post("/videos/{stored_filename}/storyboard")
+async def generate_storyboard(
+    stored_filename: str = FastPath(...),
+) -> dict:
+    """Generate a video storyboard from existing analysis services.
+
+    Builds a shot-by-shot storyboard from analysis services P2-01 through P2-08.
+    Missing information remains unavailable/empty rather than fabricated.
+
+    Args:
+        stored_filename: The stored video filename.
+
+    Returns:
+        Storyboard dict with shot-by-shot breakdown and aggregated summary.
+    """
+    service = StoryboardService()
+    storyboard = service.generate_storyboard(stored_filename=stored_filename)
+
+    return {
+        "success": True,
+        "message": "Storyboard generated successfully",
+        "video_filename": stored_filename,
+        "storyboard": storyboard,
     }
 
 
@@ -1065,6 +1349,155 @@ async def prompt_history_readiness_analysis(
         raise HTTPException(status_code=404, detail=str(e))
 
 
+# --- Day 27: Prompt Readiness Timeline -------------------------------------
+# Static "/prompt/history/readiness/timeline" route, registered BEFORE the
+# plain numeric {version} routes below so it can never collide with them.
+# Read-only: never modifies history/favorites/tags, never saves results.
+
+
+@router.get("/videos/{stored_filename}/prompt/history/readiness/timeline")
+async def prompt_history_readiness_timeline(
+    stored_filename: str = FastPath(...),
+    versions: "list[str] | None" = Query(None),
+):
+    """Chain Day 26 readiness diffs across consecutive versions (read-only).
+
+    No versions query: every live version, ascending version order.
+    ``?versions=1,3,5``: only those versions, order preserved (never
+    substituted or reordered). Each timeline step is the exact Day 26
+    comparison for one consecutive pair. Empty/malformed/duplicate/
+    non-positive versions -> 422; missing/deleted version -> 404. A
+    video with no saved versions returns an empty timeline with 200.
+    """
+    selected = _parse_versions_query(versions)
+    _validate_history_video(stored_filename)
+
+    try:
+        return readiness_timeline_service.build_timeline(
+            stored_filename, selected
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# --- Day 28: Prompt Readiness Snapshot --------------------------------------
+# Static "/prompt/history/readiness/snapshot" route, registered BEFORE the
+# plain numeric {version} routes below so it can never collide with them.
+# Read-only: never modifies history/favorites/tags, never saves results.
+
+
+@router.get("/videos/{stored_filename}/prompt/history/readiness/snapshot")
+async def prompt_history_readiness_snapshot(
+    stored_filename: str = FastPath(...),
+    versions: "list[str] | None" = Query(None),
+):
+    """Snapshot Day 24 readiness of selected saved versions (read-only).
+
+    No versions query: every live version, ascending version order.
+    ``?versions=1,3,5``: only those versions, order preserved (never
+    substituted or reordered). Each snapshot carries Day 24 readiness
+    states/scores plus Day 17 favorite/tags metadata. Empty/malformed/
+    duplicate/non-positive versions -> 422; missing/deleted version ->
+    404. A video with no saved versions returns an empty snapshot with
+    HTTP 200.
+    """
+    selected = _parse_versions_query(versions)
+    _validate_history_video(stored_filename)
+
+    try:
+        return readiness_snapshot_service.create_snapshot(
+            stored_filename, selected
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# --- Day 29: Prompt Readiness Report ----------------------------------------
+# Static "/prompt/history/readiness/report" route, registered BEFORE the
+# plain numeric {version} routes below so it can never collide with them.
+# Read-only: never modifies history/favorites/tags, never saves results.
+
+
+@router.get("/videos/{stored_filename}/prompt/history/readiness/report")
+async def prompt_history_readiness_report(
+    stored_filename: str = FastPath(...),
+    versions: "list[str] | None" = Query(None),
+):
+    """Combine Day 28 snapshot and Day 27 timeline into one report (read-only).
+
+    No versions query: every live version, ascending version order.
+    ``?versions=1,3,5``: only those versions, order preserved (never
+    substituted or reordered). The report carries the exact Day 28
+    per-version snapshots and aggregate summary, the exact Day 27
+    timeline steps and totals, and deterministic report metadata.
+    Empty/malformed/duplicate/non-positive versions -> 422;
+    missing/deleted version -> 404. A video with no saved versions
+    returns an empty report with HTTP 200.
+    """
+    selected = _parse_versions_query(versions)
+    _validate_history_video(stored_filename)
+
+    try:
+        return readiness_report_service.generate_report(
+            stored_filename, selected
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# --- Day 30: Prompt Readiness Report Export ---------------------------------
+# Static "/prompt/history/readiness/report/export" route, registered BEFORE
+# the plain numeric {version} routes below so it can never collide with
+# them. Read-only serialization of the exact Day 29 report: never modifies
+# history/favorites/tags, never creates files in storage, never persists.
+
+
+@router.get("/videos/{stored_filename}/prompt/history/readiness/report/export")
+async def prompt_history_readiness_report_export(
+    stored_filename: str = FastPath(...),
+    versions: "list[str] | None" = Query(None),
+    format: str = Query(...),
+):
+    """Export the Day 29 readiness report as json, markdown, or txt.
+
+    Read-only: the payload is exactly the Day 29 report serialized by
+    the export service - nothing is modified, created, or saved on
+    disk. Selection follows Day 25/29 semantics: no versions query ->
+    every live version ascending; ``?versions=1,3,5`` -> requested
+    order preserved (never substituted or reordered); repeated
+    parameters and whitespace tolerated. Empty/malformed/duplicate/
+    non-positive versions -> 422; missing/deleted version -> 404;
+    invalid format -> 422. Response carries the deterministic
+    filename ``visionprompt_readiness_report.<ext>``.
+    Example: GET .../readiness/report/export?format=markdown
+    """
+    _validate_history_video(stored_filename)
+
+    if format not in VALID_EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid format. Must be one of: "
+            + ", ".join(sorted(VALID_EXPORT_FORMATS)),
+        )
+
+    selected = _parse_versions_query(versions)
+
+    try:
+        export = readiness_report_export_service.export_report(
+            stored_filename, selected, format
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return Response(
+        content=export["content"],
+        media_type=export["media_type"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{export["filename"]}"'
+        },
+    )
+
+
 # --- Day 17: Prompt Favorites & Tags -------------------------------------
 # Static routes ("/favorites", "/tag/{tag}") are registered BEFORE the
 # numeric {version} route so they can never be captured by it.
@@ -1529,3 +1962,57 @@ async def validate_prompt_readiness(
         raise HTTPException(status_code=422, detail=str(e))
 
     return {"video_filename": stored_filename, **result}
+
+
+@router.post("/videos/{stored_filename}/prompt/reconstruct")
+async def reconstruct_video_prompt(
+    stored_filename: str = FastPath(...),
+    depth: str = Query(default="standard"),
+    style: str = Query(default="cinematic"),
+):
+    """Reconstruct a structured analysis report and production prompt.
+
+    P2-01: analyzes the stored video directly (no saved prompt required)
+    and returns per-domain availability (observed/estimated/unavailable),
+    confidence and uncertainty notes, the reconstructed production
+    prompt, plus Day 21 quality and Day 24 readiness of that prompt.
+
+    depth: one of 'quick', 'standard', 'deep' (default standard).
+    style: one of 'cinematic', 'realistic', 'commercial' (default cinematic).
+    """
+    if depth not in VALID_DEPTHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid depth. Must be one of: {', '.join(sorted(VALID_DEPTHS))}",
+        )
+    if style not in VALID_STYLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid style. Must be one of: {', '.join(sorted(VALID_STYLES))}",
+        )
+
+    try:
+        validate_file_extension(stored_filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video filename.")
+
+    filepath = (STORAGE_DIR / stored_filename).resolve()
+    if not str(filepath).startswith(str(STORAGE_DIR.resolve())) or not filepath.exists():
+        raise HTTPException(status_code=404, detail="Video file not found.")
+
+    try:
+        result = reconstruction_service.reconstruct(
+            stored_filename=stored_filename,
+            depth=depth,
+            style=style,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Prompt reconstruction failed.")
+
+    return {
+        "success": True,
+        "message": "Prompt reconstruction completed successfully",
+        **result,
+    }
