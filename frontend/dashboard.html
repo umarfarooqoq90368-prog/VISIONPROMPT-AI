@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VisionPrompt AI - Dashboard</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --bg-subtle: #12121a;
+            --card: #1a1a24;
+            --card-hover: #22222d;
+            --fg: #e8e8f0;
+            --muted: #6b6b80;
+            --accent: #00d4aa;
+            --accent-dim: rgba(0, 212, 170, 0.15);
+            --error: #ff4757;
+            --warning: #ffa502;
+            --border: #2a2a3a;
+            --radius: 8px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        a:hover {
+            color: #00f5c4;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            margin: 0;
+            font-weight: 600;
+        }
+
+        img {
+            max-width: 100%;
+            display: block;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            background: var(--bg-subtle);
+            border-right: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .sidebar-logo {
+            padding: 24px;
+            border-bottom: 1px solid var(--border);
+            text-align: center;
+        }
+
+        .sidebar-logo h2 {
+            color: var(--accent);
+            font-size: 1.25rem;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            color: var(--muted);
+            text-decoration: none;
+            font-size: 0.9375rem;
+            transition: color 0.2s;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .nav-link:hover {
+            color: var(--fg);
+        }
+
+        .nav-link.active {
+            color: var(--accent);
+            background: var(--card);
+        }
+
+        .nav-icon {
+            width: 20px;
+            margin-right: 12px;
+        }
+
+        /* Top bar */
+        .topbar {
+            flex: 1;
+            background: var(--card);
+            padding: 0 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .topbar-search {
+            flex: 1;
+            max-width: 300px;
+            margin: 0 16px;
+        }
+
+        .topbar-search input {
+            width: 100%;
+            padding: 8px 12px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--fg);
+            font-size: 0.875rem;
+        }
+
+        .topbar-user {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            background: var(--accent);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: var(--bg);
+            font-size: 0.875rem;
+        }
+
+        /* Main content */
+        .main-content {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+        }
+
+        .welcome-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            margin-bottom: 24px;
+        }
+
+        .welcome-card h2 {
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+
+        .upload-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            margin-bottom: 24px;
+        }
+
+        .upload-card h2 {
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin: 20px 0;
+        }
+
+        .drop-zone:hover {
+            border-color: var(--accent);
+        }
+
+        .drop-zone.drag-over {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+        }
+
+        .upload-progress {
+            margin: 16px 0;
+            display: none;
+        }
+
+        .upload-progress.active {
+            display: block;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--accent);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .stage-badge {
+            padding: 4px 8px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+
+        .stage-badge.processing { color: var(--accent); }
+        .stage-badge.complete { color: #28a745; }
+        .stage-badge.unavailable { color: var(--muted); }
+        .stage-badge.failed { color: var(--error); }
+
+        /* Analysis workspace */
+        .workspace {
+            display: grid;
+            grid-template-columns: 280px 1fr 300px;
+            gap: 24px;
+            margin-top: 24px;
+        }
+
+        @media (max-width: 1400px) {
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Left: video player/preview */
+        .panel.left {
+            order: 1;
+        }
+
+        /* Center: timeline/stages */
+        .panel.center {
+            order: 2;
+        }
+
+        /* Right: analysis info */
+        .panel.right {
+            order: 3;
+        }
+
+        .analysis-panel {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+        }
+
+        .panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex);
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel-title {
+            font-weight: 500;
+        }
+
+        .panel-close {
+            background: transparent;
+            border: none;
+            color: var(--muted);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: var(--radius);
+        }
+
+        .panel-close:hover {
+            color: var(--error);
+        }
+
+        .stage-list {
+            padding: 0;
+        }
+
+        .stage-list li {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex);
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .stage-list li:last-child {
+            border-bottom: none;
+        }
+
+        .stage-info {
+            flex: 1;
+        }
+
+        .stage-name {
+            font-size: 0.875rem;
+        }
+
+        .stage-status {
+            padding: 2px 6px;
+            background: var(--card);
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .stage-status.processing { background: var(--accent-dim); color: var(--accent); }
+        .stage-status.complete { background: #28a7453d; color: #28a745; }
+        .stage-status.unavailable { background: var(--bg-subtle); color: var(--muted); }
+        .stage-status.failed { background: #ff47572d; color: var(--error); }
+
+        /* Right panel: analysis info */
+        .right-panel {
+            padding: 24px;
+        }
+
+        .right-panel h3 {
+            margin-bottom: 24px;
+            color: var(--accent);
+        }
+
+        .info-section {
+            margin-bottom: 24px;
+        }
+
+        .info-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .info-section h4 {
+            margin-bottom: 12px;
+            font-size: 0.875rem;
+            color: var(--muted);
+            text-transform: uppercase;
+        }
+
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .info-item:last-child {
+            border-bottom: none;
+        }
+
+        .info-label {
+            color: var(--muted);
+            font-size: 0.875rem;
+        }
+
+        .info-value {
+            color: var(--fg);
+            font-family: monospace;
+        }
+
+        .status-badge-large {
+            padding: 12px 24px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            font-size: 2rem;
+            font-weight: 700;
+            text-align: center;
+        }
+
+        .status-badge-large.pass { color: #28a745; }
+        .status-badge-large.warning { color: var(--warning); }
+        .status-badge-large.fail { color: var(--error); }
+        .status-badge-large.unavailable { color: var(--muted); }
+
+        /* Upload form */
+        .file-input {
+            display: none;
+        }
+
+        .btn-browse {
+            background: transparent;
+            border: 2px dashed var(--border);
+            color: var(--muted);
+            padding: 10px 20px;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-size: 0.875rem;
+        }
+
+        .btn-browse:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .btn-analyze {
+            width: 100%;
+            background: var(--accent);
+            color: var(--bg);
+            border: none;
+            padding: 12px;
+            font-size: 1.1rem;
+            font-weight: 500;
+            border-radius: var(--radius);
+            cursor: pointer;
+            margin-top: 16px;
+        }
+
+        .btn-analyze:disabled {
+            background: var(--muted);
+            cursor: not-allowed;
+        }
+
+        /* Shot detection */
+        .shots-timeline {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+        }
+
+        .shot-item {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr 1fr;
+            gap: 8px;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.75rem;
+        }
+
+        .shot-item:last-child {
+            border-bottom: none;
+        }
+
+        .shot-number {
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .shot-transition {
+            color: var(--muted);
+        }
+
+        .shot-type {
+            color: var(--muted);
+        }
+
+        /* Quality/readiness */
+        .quality-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .quality-item {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            text-align: center;
+        }
+
+        .quality-label {
+            font-size: 0.75rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .quality-score {
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+    </style>
+</head>
+<body>
+    <div style="display: flex; height: 100vh; font-family: 'Segoe UI', Tahoma, Arial, sans-serif;">
+        
+        <!-- Sidebar -->
+        <div class="sidebar" style="width: 260px; background: var(--bg-subtle); border-right: 1px solid var(--border); flex-shrink: 0;">
+            <div class="sidebar-logo">
+                <h2>VisionPrompt AI</h2>
+            </div>
+            
+            <nav style="padding: 16px;">
+                <a href="/app/dashboard" class="nav-link active">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M3 3l7 17 3-11 7 15-3 5-11-3 15 7-17-7-5 3-11 7Z"/>
+                    </svg>
+                    Dashboard
+                </a>
+                <a href="/app/analyze" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="12 6 12 12 16 14"></polyline>
+                    </svg>
+                    Analyze Video
+                </a>
+                <a href="/app/storyboard" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="3" y9="12" x2="21" y9="12"></line>
+                        <line x1="9" y21="12" x2="15" y21="12"></line>
+                    </svg>
+                    Storyboard
+                </a>
+                <a href="/app/quality" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                    Quality
+                </a>
+                <a href="/app/readiness" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="12 6 12 12 15 15"></polyline>
+                    </svg>
+                    Readiness
+                </a>
+                <a href="/app/history" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                    </svg>
+                    History
+                </a>
+                <a href="/app/batches" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="3" y9="12" x2="21" y9="12"></line>
+                        <line x1="9" y21="12" x2="15" y21="12"></line>
+                    </svg>
+                    Batches
+                </a>
+                <a href="/app/projects" class="nav-link">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M3 3h2l20 20H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM12 3a1 1 0 0 1 1 1v12a1 1 0 0 1-2 0V5a1 1 0 0 1 1-1z"></path>
+                    </svg>
+                    Projects
+                </a>
+            </nav>
+        </div>
+        
+        <div class="main-content" style="flex: 1; padding: 24px; overflow-y: auto;">
+            
+            <!-- Top bar -->
+            <div class="topbar" style="background: var(--card); padding: 0 24px; display: flex; justify-content: space-between; align-items: center;">
+                <h1 style="font-size: 1.5rem; margin: 0;">Dashboard</h1>
+                <div class="topbar-user">
+                    <div class="user-avatar">U</div>
+                    <span style="color: var(--muted);">User</span>
+                </div>
+            </div>
+            
+            <!-- Welcome -->
+            <div class="welcome-card" style="background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 32px; margin-bottom: 24px;">
+                <h2 style="margin-bottom: 16px;">Turn your footage into production-ready prompts.</h2>
+                <p style="color: var(--muted);">Upload a video to begin the analysis pipeline.</p>
+            </div>
+            
+            <!-- Upload card -->
+            <div class="upload-card" style="background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 32px;">
+                <h2 style="margin-bottom: 16px;">Upload Video</h2>
+                
+                <p style="color: var(--muted); margin-bottom: 12px; font-size: 0.875rem;">
+                    Supported: MP4, MOV, MKV, WEBM, AVI • Max: 500MB
+                </p>
+                
+                <input type="file" class="file-input" id="videoFile" accept="video/mp4,video/mov,video/mkv,video/webm,video/avi">
+                <label for="videoFile" class="btn-browse">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                        <polygon points="13 2 3 14 12 14 11 2 13 2"></polygon>
+                    </svg>
+                    Browse Files
+                </label>
+                <button class="btn-analyze" disabled>Start Analysis</button>
+            </div>
+            
+            <!-- Recent analyses -->
+            <div style="background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px;">
+                <h3 style="margin-bottom: 16px; color: var(--accent);">Recent Analyses</h3>
+                <p style="color: var(--muted); font-size: 0.875rem;">No analyses yet. Upload a video to get started.</p>
+            </div>
+            
+            <!-- System status -->
+            <div style="background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px;">
+                <h3 style="margin-bottom: 16px; color: var(--accent);">System Status</h3>
+                <div style="display: flex; gap: 24px; align-items: center;">
+                    <span style="color: var(--accent);">CONNECTED</span>
+                    <span style="color: var(--muted);">Backend API</span>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+
+    <script>
+        // API service layer
+        const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
+
+        // File upload
+        document.getElementById('videoFile').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            const analyzeBtn = document.querySelector('.btn-analyze');
+            analyzeBtn.disabled = !file;
+        });
+
+        // Drag and drop
+        const dropZone = document.querySelector('.drop-zone');
+        const videoFile = document.getElementById('videoFile');
+
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, preventDefaults, false);
+        });
+
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.add('drag-over'), false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.remove('drag-over'), false);
+        });
+
+        dropZone.addEventListener('drop', function(e) {
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                videoFile.files = e.dataTransfer.files;
+                videoFile.dispatchEvent(new Event('change'));
+            }
+        });
+
+        // Analyze button
+        document.querySelector('.btn-analyze').addEventListener('click', async () => {
+            const file = videoFile.files[0];
+            if (!file) return;
+
+            const analyzeBtn = document.querySelector('.btn-analyze');
+            analyzeBtn.disabled = true;
+            analyzeBtn.textContent = 'Analyzing...';
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const res = await fetch(`${API_BASE}/videos/upload`, {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await res.json();
+                console.log('Upload response:', data);
+                alert('Upload: ' + (data.success ? 'success' : 'failed'));
+            } catch (err) {
+                console.error('Upload error:', err);
+                alert('Upload failed - check backend connectivity');
+            } finally {
+                analyzeBtn.disabled = false;
+                analyzeBtn.textContent = 'Start Analysis';
+            }
+        });
+
+        // Initialize on load
+        document.addEventListener('DOMContentLoaded', async () => {
+            const health = await checkBackendHealth();
+            if (!health) {
+                alert('Backend API unreachable. Using mock mode.');
+            }
+        });
+    </script>
+</body>
+</html>
