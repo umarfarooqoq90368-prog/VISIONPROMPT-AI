@@ -3067,3 +3067,4 @@ POST /api/videos/{stored_filename}/prompt/reconstruct?depth=standard&style=cinem
 - `tests/test_video_reconstruction_service.py` - 101 service tests
 - `tests/test_video_reconstruction_api.py` - 56 API tests
 - `backend/phase2_e2e.py` - progressive Phase 2 manual E2E script (MVP regression + P2-01..P2-13 sections)
+'verification'  
