@@ -1,0 +1,43 @@
+name: Deploy Frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - frontend/**
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-dir: ./frontend
+        run: npm install
+
+      - name: Run Vite build
+        working-dir: ./frontend
+        run: npm run build
+
+      - name: Upload artifact for GitHub Pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-pages-dist
+          path: frontend/dist
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./frontend/dist
+          keep_files: true
+          user_name: ${{ github.actor }}
+          user_email: ${{ github.event.sender.email }}
