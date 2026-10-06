@@ -5,10 +5,15 @@ on:
     branches: [main]
     paths:
       - frontend/**
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -26,6 +31,10 @@ jobs:
       - name: Run Vite build
         working-dir: ./frontend
         run: npm run build
+
+      - name: Verify build output
+        working-dir: ./frontend
+        run: test -f dist/index.html
 
       - name: Upload artifact for GitHub Pages
         uses: actions/upload-artifact@v4
