@@ -8,6 +8,7 @@ storage/frames/*
 storage/audio/*
 storage/outputs/*
 *.egg-info/
+node_modules/
 dist/
 build/
 .idea/
