@@ -1,8 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Trigger GitHub Pages deployment
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [react()],
-  base: "/VISIONPROMPT-AI/",
-});
+  base: mode === "production" && !process.env.VERCEL ? "/VISIONPROMPT-AI/" : "/",
+}));
