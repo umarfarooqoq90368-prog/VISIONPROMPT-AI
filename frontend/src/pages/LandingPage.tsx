@@ -156,9 +156,9 @@ function Step({children}) {
   return (
     <div className="flex flex-col items-center text-center">
       <span className="step-number rounded-full bg-accent-dim text-accent w-12 h-12 flex items-center justify-center font-bold text-sm mb-3">
-        {children.props.children}
+        {children}
       </span>
-      {children.props.children}
+      {children}
     </div>
   );
 }
