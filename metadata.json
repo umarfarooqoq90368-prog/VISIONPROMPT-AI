@@ -1,0 +1,6 @@
+{
+  "name": "Scene Prompt Studio",
+  "description": "Turn Any Video Into Scene-by-Scene AI Prompts. Automated scene detection, character & style consistency, and Google Flow-ready prompts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
